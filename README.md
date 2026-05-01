@@ -11,7 +11,7 @@ multimodal medical AI models, without full retraining.
 - [x] Step 1: Environment setup
 - [x] Step 2: Foundational understanding + toy pipeline
 - [x] Step 3: LoRA fine-tuning
-- [ ] Step 4: Gradient concentration ratio ρ(p)
+- [x] Step 4: Gradient concentration ratio ρ(p)
 - [ ] Step 5: LoRA-Subtraction algorithm
 - [ ] Step 6: Federated protocol
 - [ ] Step 7: Experiments E1–E6
