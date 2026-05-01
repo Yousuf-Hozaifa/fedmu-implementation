@@ -9,7 +9,7 @@ multimodal medical AI models, without full retraining.
 
 ## Status
 - [x] Step 1: Environment setup
-- [ ] Step 2: Foundational understanding + toy pipeline
+- [x] Step 2: Foundational understanding + toy pipeline
 - [ ] Step 3: LoRA fine-tuning
 - [ ] Step 4: Gradient concentration ratio ρ(p)
 - [ ] Step 5: LoRA-Subtraction algorithm
