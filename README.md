@@ -14,8 +14,8 @@ multimodal medical AI models, without full retraining.
 - [x] Step 4: Gradient concentration ratio ρ(p)
 - [x] Step 5: LoRA-Subtraction algorithm
 - [x] Step 6: Federated protocol
-- [ ] Step 7: Experiments E1–E6
-- [ ] Step 8: Analysis
+- [x] Step 7: Experiments E1–E6
+- [x] Step 8: Analysis
 
 ## Setup
 ```bash
