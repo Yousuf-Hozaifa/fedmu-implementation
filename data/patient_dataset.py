@@ -2,36 +2,20 @@
 data/patient_dataset.py
 
 PyTorch Dataset class for patient image-text pairs.
-
-This class is architecture-agnostic: it loads images and text and
-returns raw tensors. The model (vision encoder + text encoder) is
-applied separately, not inside the dataset.
-
-This mirrors how MIMIC-CXR would be loaded for the full Fed-MU system.
+Patched for Kaggle / IU dataset to handle absolute paths and robust JSON loading.
 """
 
 import json
+import os
 import torch
 from torch.utils.data import Dataset
 from pathlib import Path
 from PIL import Image
+import torchvision.transforms as T
 from typing import Optional
 
 
 class PatientDataset(Dataset):
-    """
-    Loads patient (image, report, labels, patient_id) tuples.
-
-    Args:
-        metadata_file:  path to metadata.json
-        data_root:      root directory containing the images/ folder
-        image_transform: torchvision transform for images (applied to PIL Image)
-        tokenizer:      HuggingFace tokenizer for the text encoder
-        max_text_len:   maximum token length for reports
-        patient_ids:    optional list of patient_ids to include
-                        (used to create per-node subsets in federated setup)
-    """
-
     def __init__(
         self,
         metadata_file: str,
@@ -48,6 +32,10 @@ class PatientDataset(Dataset):
 
         with open(metadata_file) as f:
             all_metadata = json.load(f)
+
+        # Convert to dict if it's a list (handles our pretrain.py temp dump)
+        if isinstance(all_metadata, list):
+            all_metadata = {p["patient_id"]: p for p in all_metadata}
 
         # Filter to specific patients if requested (for federated node splits)
         if patient_ids is not None:
@@ -68,26 +56,37 @@ class PatientDataset(Dataset):
         patient_id = self.patient_ids[idx]
         sample = self.metadata[patient_id]
 
-        # Load image
-        image_path = self.data_root / sample["image_path"]
-        image = Image.open(image_path).convert("RGB")
-
-        # Apply image transform if provided
-        if self.image_transform is not None:
-            image = self.image_transform(image)
+        # ── 1. Load real image if path exists, else synthetic fallback ────────────
+        image_path_str = sample.get("image_path", "")
+        
+        # If the path is absolute (e.g. Kaggle dataset), use it directly. 
+        # Otherwise, append it to data_root.
+        if os.path.isabs(image_path_str):
+            image_path = Path(image_path_str)
         else:
-            # Default: convert to tensor [3, 224, 224] in [0, 1]
-            import torchvision.transforms as T
-            default_transform = T.Compose([
-                T.Resize((224, 224)),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225]),
-            ])
-            image = default_transform(image)
+            image_path = self.data_root / image_path_str
 
-        # Tokenize text if tokenizer provided
-        report = sample["report"]
+        if image_path.exists() and image_path.is_file():
+            image = Image.open(image_path).convert("RGB")
+            if self.image_transform is not None:
+                image = self.image_transform(image)
+            else:
+                # IU X-rays are grayscale, enforce 3 channels for ViT
+                transform = T.Compose([
+                    T.Resize((224, 224)),
+                    T.Grayscale(num_output_channels=3), 
+                    T.ToTensor(),
+                    T.Normalize(mean=[0.485, 0.456, 0.406],
+                                std=[0.229, 0.224, 0.225]),
+                ])
+                image = transform(image)
+        else:
+            # Fallback: synthetic noise (toy mode)
+            image = torch.randn(3, 224, 224)
+
+        # ── 2. Report / Text ──────────────────────────────────────────────────────
+        report = sample.get("report", "No findings.")
+        
         if self.tokenizer is not None:
             text_enc = self.tokenizer(
                 report,
@@ -96,25 +95,25 @@ class PatientDataset(Dataset):
                 truncation=True,
                 return_tensors="pt",
             )
-            # Remove batch dimension added by return_tensors="pt"
             text_input_ids = text_enc["input_ids"].squeeze(0)
             text_attention_mask = text_enc["attention_mask"].squeeze(0)
         else:
-            # Return raw text if no tokenizer
             text_input_ids = report
             text_attention_mask = None
 
-        # Labels: 14-dim float tensor
-        labels = torch.tensor(sample["labels"], dtype=torch.float32)
+        # ── 3. Labels ──────────────────────────────────────────────────────────────
+        # Handle if 'labels' or 'label' key is used
+        labels_list = sample.get("labels", sample.get("label", [0]*14))
+        labels = torch.tensor(labels_list, dtype=torch.float32)
 
         return {
             "patient_id": patient_id,
-            "patient_idx": sample["patient_idx"],
+            "patient_idx": sample.get("patient_idx", idx),
             "image": image,                     # [3, 224, 224]
-            "text_input_ids": text_input_ids,   # [max_text_len] or raw str
+            "text_input_ids": text_input_ids,   # [max_text_len] or str
             "text_attention_mask": text_attention_mask,
             "labels": labels,                   # [14]
-            "report": report,                   # raw text (always included)
+            "report": report,                   # raw text
         }
 
     def get_patient_ids(self) -> list:

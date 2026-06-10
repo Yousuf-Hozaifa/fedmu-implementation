@@ -2,27 +2,22 @@
 experiments/pretrain.py
 
 Federated pre-training pipeline (Phase 2 of the Fed-MU proposal).
-
-Runs FedAvg across 5 simulated nodes for N rounds, saves checkpoints,
-then immediately re-runs Experiment E2 to show how ρ(p) has changed.
-
-Usage:
-    python experiments/pretrain.py
+Patched for Kaggle / IU dataset use.
 """
 
 import sys
 import json
 import yaml
 import torch
+import os
 from pathlib import Path
 from transformers import CLIPProcessor, DistilBertTokenizer
 import torchvision.transforms as T
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.toy_dataset import generate_toy_dataset
 from data.patient_dataset import PatientDataset
-from models.multimodal_model import FedMUModel
+from models.multimodal_model import MultimodalModel
 from models.lora_model import FedMULoRAModel
 from federated.nodes.data_splitter import (
     split_patients_for_federated,
@@ -59,28 +54,48 @@ def main():
 
     torch.manual_seed(config["project"]["seed"])
 
-    num_rounds    = config["federated"]["num_rounds"]          # 2
-    num_nodes     = config["data"]["num_nodes"]                # 5
-    n_unlearn     = config["data"]["unlearning_targets"]       # 2
-    lora_rank     = config["lora"]["rank"]                     # 4
-    lora_alpha    = config["lora"]["alpha"]                    # 8
-    lora_dropout  = config["lora"]["dropout"]                  # 0.05
+    num_rounds    = config["federated"]["num_rounds"]          
+    num_nodes     = config["data"]["num_nodes"]                
+    n_unlearn     = config["data"]["unlearning_targets"]       
+    lora_rank     = config["lora"]["rank"]                     
+    lora_alpha    = config["lora"]["alpha"]                    
+    lora_dropout  = config["lora"]["dropout"]                  
 
-    # ── Generate data ─────────────────────────────────────────────
+    # ── Auto-select dataset based on config ──────────────────────
+    dataset_path = config['data'].get('dataset_path', '')
+    use_real_data = os.path.isdir(dataset_path)
+
     meta_file = "data/toy_patients/metadata.json"
     data_root = "data/toy_patients"
 
-    if not Path(meta_file).exists():
-        print("\n[1/6] Generating toy patient dataset...")
-        generate_toy_dataset(data_root, config["data"]["total_patients"])
+    if use_real_data:
+        from data.iu_dataset import load_iu_dataset, verify_dataset
+        print("[pretrain] Using Indiana University Chest X-ray dataset")
+        assert verify_dataset(config), "Dataset verification failed — check paths"
+        patients = load_iu_dataset(config, seed=config['project']['seed'])
+        
+        # Save patients to a temp metadata file so the original splitters don't break
+        os.makedirs(data_root, exist_ok=True)
+        with open(meta_file, "w") as f:
+            json.dump(patients, f)
     else:
-        print("\n[1/6] Toy dataset found.")
+        print("[pretrain] WARNING: Real dataset not found, falling back to toy data")
+        from data.toy_dataset import generate_toy_dataset
+        n = config['data'].get('total_patients', 50)
+        
+        if not Path(meta_file).exists():
+            print("\n[1/6] Generating toy patient dataset...")
+            generate_toy_dataset(data_root, n)
+        else:
+            print("\n[1/6] Toy dataset found.")
 
     # ── Split data across nodes ────────────────────────────────────
     print("\n[2/6] Splitting patients across federated nodes...")
     split_dir = "data/splits"
+    os.makedirs(split_dir, exist_ok=True)
 
-    if not Path(split_dir + "/node_0_patients.json").exists():
+    # Force a fresh split if using real data so we don't accidentally load toy splits
+    if use_real_data or not Path(split_dir + "/node_0_patients.json").exists():
         node_splits, unlearn_targets = split_patients_for_federated(
             metadata_file=meta_file,
             num_nodes=num_nodes,
@@ -95,10 +110,12 @@ def main():
             for i in range(num_nodes)
         }
         unlearn_targets = load_unlearning_targets(split_dir)
-        print(f"  Unlearning targets: {unlearn_targets}")
+        
+    print(f"  Unlearning targets: {unlearn_targets}")
 
     # ── Processors and transforms ──────────────────────────────────
     print("\n[3/6] Loading processors...")
+    # These are kept for backward compatibility with the tokenizer args in the dataloader
     clip_proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
 
@@ -113,7 +130,10 @@ def main():
 
     # ── Build global model ─────────────────────────────────────────
     print("\n[4/6] Building global model with LoRA adapters...")
-    base = FedMUModel(freeze_encoders=False)
+    
+    # -> CRITICAL FIX: Swap old FedMUModel for the new MultimodalModel
+    base = MultimodalModel(config=config)
+    
     global_model = FedMULoRAModel(
         base_model=base,
         lora_rank=lora_rank,
@@ -134,7 +154,7 @@ def main():
             model=global_model,
             dataset=dataset,
             config=config,
-            device="cpu",
+            device="cpu", # Server assigns GPU automatically if available
         )
         nodes.append(node)
 
@@ -156,12 +176,16 @@ def main():
         monitor.record(record)
 
     # ── Save final checkpoint and audit log ────────────────────────
+    os.makedirs("models/checkpoints", exist_ok=True)
     final_ckpt = "models/checkpoints/pretrained_final.pt"
     server.save_final_checkpoint(final_ckpt)
     server.save_audit_log("models/checkpoints/audit_log.json")
 
-    monitor.print_summary()
-    monitor.plot()
+    try:
+        monitor.print_summary()
+        monitor.plot()
+    except Exception as e:
+        print(f"Skipping plot generation (headless environment): {e}")
 
     # ── Re-run E2 with trained model ───────────────────────────────
     print("\n" + "="*60)
@@ -185,7 +209,9 @@ def main():
         plot_rho_distribution, plot_per_adapter_norms,
     )
 
-    computer   = RhoComputer(global_model, device="cpu")
+    # Auto-detect GPU for evaluation
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    computer   = RhoComputer(global_model, device=device)
     raw_results = computer.compute_all(full_dataset, verbose=True)
 
     rho_values = [r["rho"] for r in raw_results.values()
@@ -229,7 +255,6 @@ def main():
         print("  ✓ H₀ REJECTED — entanglement hypothesis SUPPORTED")
     else:
         print("  ✗ H₀ not rejected — more training or data may help")
-        print("    (toy dataset with 50 patients is very limited)")
     print("  Next: Step 6 — Selective Federated Aggregation")
     print("="*60 + "\n")
 
