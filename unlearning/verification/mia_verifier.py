@@ -1,33 +1,31 @@
 """
-unlearning/verification/mia_verifier.py
+unlearning/verification/mia_verifier.py  [FINAL — v3]
 
-Membership Inference Attack verification for machine unlearning.
+FINAL FIX: Membership score fallback when n_target=1.
 
-The MIA asks: "Can an attacker determine whether patient_0000
-was in the training data?" After successful unlearning, the
-model should behave identically on patient_0000's data as on
-data it never saw — making the attack no better than guessing.
+With only one target patient in a toy dataset, roc_auc_score
+is statistically meaningless (essentially random with 6 samples).
 
-Method (shadow model approach):
-  1. Collect confidence features from the model for:
-       MEMBERS:     patients the model WAS trained on
-       NON-MEMBERS: patients the model was NOT trained on
-  2. Train a binary classifier to distinguish members/non-members
-  3. Apply to the target patient → check their membership score
-  4. Compare: before unlearning vs after unlearning
+The membership score (0.9073 in previous runs) is the CORRECT
+primary metric at this scale. It directly answers:
+  "Does the shadow model think this patient is still a member?"
+  High score (~0.9) → model still recognises patient (not forgotten)
+  Low score (~0.5) → model no longer recognises patient (forgotten)
 
-Target: AUC ≤ 0.55 after unlearning
-This implies MIA advantage γ = |AUC - 0.5| ≤ 0.05
-And via the ε-bridge: ε ≲ 2γ ≤ 0.10
+After correct unlearning with α=1.0, the membership score should
+drop from ~0.9 toward ~0.5.
+
+Pass condition (n_target=1 fallback):
+  score ≤ 0.60 → near random chance → PASS
+  score > 0.60 → model still recognises patient → FAIL
+
+For n_target > 5, the original AUC-based check is used.
 """
 
 import torch
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import roc_auc_score, accuracy_score
+from sklearn.metrics import roc_auc_score
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import sys
@@ -37,19 +35,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 class ConfidenceFeatureExtractor:
     """
-    Extracts confidence-based features from model outputs.
-    These features are what the MIA shadow classifier uses.
-
-    Features per sample:
-      1. max_prob:      highest sigmoid probability across 14 classes
-      2. mean_prob:     mean probability across all 14 classes
-      3. entropy:       prediction entropy (higher = more uncertain)
-      4. loss:          cross-entropy loss value
-      5. margin:        gap between top-2 probabilities
-      6. correct_prob:  probability on the true positive class
-
-    High-confidence, low-entropy, low-loss = model likely MEMORISED this sample
-    Low-confidence, high-entropy, high-loss = model likely NEVER SAW this sample
+    Extracts 6 confidence-based features from model outputs.
+    Features: max_prob, mean_prob, entropy, ce_loss, margin, correct_prob
     """
 
     def __init__(self, model, device: str = "cpu"):
@@ -57,10 +44,6 @@ class ConfidenceFeatureExtractor:
         self.device = device
 
     def extract_single(self, sample: dict) -> np.ndarray:
-        """
-        Extract features for a single patient sample.
-        Returns a 1D numpy array of shape (6,).
-        """
         self.model.eval()
         with torch.no_grad():
             pixel_values = sample["image"].unsqueeze(0).to(self.device)
@@ -75,226 +58,174 @@ class ConfidenceFeatureExtractor:
                 labels=labels,
             )
 
-            logits = outputs["logits"].squeeze(0)  # [14]
-            loss   = outputs["loss"].item()
-
-            probs = torch.sigmoid(logits)          # [14]
-            sorted_probs, _ = probs.sort(descending=True)
-
-            # Feature 1: max probability
-            max_prob = probs.max().item()
-
-            # Feature 2: mean probability
-            mean_prob = probs.mean().item()
-
-            # Feature 3: prediction entropy
-            # H = -Σ p*log(p) - (1-p)*log(1-p) for each label
-            eps    = 1e-7
-            p      = probs.clamp(eps, 1 - eps)
-            ent    = -(p * p.log() + (1 - p) * (1 - p).log()).mean().item()
-            entropy = ent
-
-            # Feature 4: cross-entropy loss
-            ce_loss = loss
-
-            # Feature 5: margin between top-2 predictions
-            margin = (sorted_probs[0] - sorted_probs[1]).item()
-
-            # Feature 6: mean probability on positive classes
-            pos_mask = (labels.squeeze(0) > 0.5)
-            if pos_mask.any():
-                correct_prob = probs[pos_mask].mean().item()
-            else:
-                correct_prob = probs.max().item()
+        logits = outputs["logits"].squeeze(0)
+        loss   = outputs["loss"].item()
+        probs  = torch.sigmoid(logits)
+        sp, _  = probs.sort(descending=True)
+        eps    = 1e-7
+        p      = probs.clamp(eps, 1 - eps)
+        ent    = -(p * p.log() + (1-p) * (1-p).log()).mean().item()
+        pos    = labels.squeeze(0) > 0.5
+        cp     = probs[pos].mean().item() if pos.any() else probs.max().item()
 
         return np.array([
-            max_prob, mean_prob, entropy, ce_loss, margin, correct_prob
+            probs.max().item(),
+            probs.mean().item(),
+            ent,
+            loss,
+            (sp[0] - sp[1]).item(),
+            cp,
         ], dtype=np.float32)
 
     def extract_dataset(
-        self,
-        dataset,
-        verbose: bool = False,
+        self, dataset, verbose: bool = False
     ) -> Tuple[np.ndarray, List[str]]:
-        """
-        Extract features for all patients in a dataset.
-
-        Returns:
-            features:    (n_patients, 6) numpy array
-            patient_ids: list of patient IDs in same order
-        """
-        features    = []
-        patient_ids = []
-
+        features, ids = [], []
         for i in range(len(dataset)):
-            sample = dataset[i]
-            feat   = self.extract_single(sample)
-            features.append(feat)
-            patient_ids.append(sample["patient_id"])
-
-            if verbose and (i + 1) % 10 == 0:
-                print(f"    Extracted features: {i+1}/{len(dataset)}")
-
-        return np.vstack(features), patient_ids
+            s = dataset[i]
+            features.append(self.extract_single(s))
+            ids.append(s["patient_id"])
+        return np.vstack(features), ids
 
 
 class MIAVerifier:
-    """
-    Full Membership Inference Attack verifier.
+    """Membership Inference Attack verifier with small-sample fallback."""
 
-    Trains a shadow classifier on known members/non-members,
-    then tests whether the target patient is still a member
-    after unlearning.
-    """
-
-    def __init__(
-        self,
-        model_before,     # model BEFORE unlearning
-        model_after,      # model AFTER unlearning
-        device: str = "cpu",
-    ):
+    def __init__(self, model_before, model_after, device: str = "cpu"):
         self.model_before = model_before
         self.model_after  = model_after
         self.device       = device
-        self.extractor_before = ConfidenceFeatureExtractor(model_before, device)
-        self.extractor_after  = ConfidenceFeatureExtractor(model_after,  device)
-        self.shadow_clf       = None
+        self.ext_before   = ConfidenceFeatureExtractor(model_before, device)
+        self.ext_after    = ConfidenceFeatureExtractor(model_after,  device)
+        self.shadow_clf   = None
 
     def train_shadow_classifier(
         self,
-        member_dataset,       # patients model WAS trained on
-        non_member_dataset,   # patients model was NOT trained on
+        member_dataset,
+        non_member_dataset,
         use_model: str = "before",
-    ):
-        """
-        Train the shadow binary classifier.
-
-        member_label    = 1  (was in training)
-        non_member_label = 0 (was NOT in training)
-
-        Args:
-            use_model: 'before' or 'after' — which model to extract from
-        """
-        extractor = (self.extractor_before if use_model == "before"
-                     else self.extractor_after)
-
+    ) -> float:
+        ext = self.ext_before if use_model == "before" else self.ext_after
         print("  Extracting member features...")
-        mem_features, _ = extractor.extract_dataset(member_dataset)
-
+        mf, _ = ext.extract_dataset(member_dataset)
         print("  Extracting non-member features...")
-        non_features, _ = extractor.extract_dataset(non_member_dataset)
-
-        X = np.vstack([mem_features, non_features])
-        y = np.array(
-            [1] * len(mem_features) + [0] * len(non_features),
-            dtype=int,
-        )
-
-        # Logistic Regression: interpretable and fast on CPU
-        self.shadow_clf = LogisticRegression(
-            max_iter=500, C=1.0, random_state=42
-        )
+        nf, _ = ext.extract_dataset(non_member_dataset)
+        X = np.vstack([mf, nf])
+        y = np.array([1]*len(mf) + [0]*len(nf), dtype=int)
+        self.shadow_clf = LogisticRegression(max_iter=500, C=1.0, random_state=42)
         self.shadow_clf.fit(X, y)
-
-        # Training AUC (upper bound — tells us the attack's max power)
-        train_preds = self.shadow_clf.predict_proba(X)[:, 1]
-        train_auc   = roc_auc_score(y, train_preds)
+        try:
+            train_auc = roc_auc_score(y, self.shadow_clf.predict_proba(X)[:,1])
+        except Exception:
+            train_auc = 0.5
         print(f"  Shadow classifier training AUC: {train_auc:.4f}")
-        print(f"  (This is the attack's capability — "
-              f"higher = attacker is stronger)")
-
         return train_auc
 
-    def test_target_patient(
+    def evaluate_on_dataset(
         self,
-        target_sample:     dict,
-        non_member_sample: dict,
+        target_dataset,
+        non_member_dataset,
         use_model: str = "after",
+        label: str = "",
     ) -> Dict:
         """
-        Test whether the target patient is still a "member"
-        according to the shadow classifier.
+        Evaluate with automatic fallback for small datasets.
 
-        Args:
-            target_sample:     the patient to forget
-            non_member_sample: a held-out patient as negative reference
-            use_model: which model to extract from ('before' or 'after')
-
-        Returns:
-            dict with membership_score, auc, advantage, interpretation
+        If n_target == 1: use membership SCORE as primary metric
+            Pass condition: score ≤ 0.60 (near random chance)
+        If n_target > 5: use AUC
+            Pass condition: 0.45 ≤ AUC ≤ 0.55
         """
-        if self.shadow_clf is None:
-            raise RuntimeError("Call train_shadow_classifier() first.")
+        assert self.shadow_clf is not None, "Call train_shadow_classifier first."
+        ext = self.ext_before if use_model == "before" else self.ext_after
 
-        extractor = (self.extractor_before if use_model == "before"
-                     else self.extractor_after)
+        t_feat, t_ids = ext.extract_dataset(target_dataset)
+        n_feat, _     = ext.extract_dataset(non_member_dataset)
 
-        # Extract features for target (true label = 1, was a member)
-        target_feat   = extractor.extract_single(target_sample)
+        t_scores = self.shadow_clf.predict_proba(t_feat)[:, 1]
+        n_scores = self.shadow_clf.predict_proba(n_feat)[:, 1]
+        mean_target = float(t_scores.mean())
+        n_target    = len(t_feat)
+        n_non_mem   = len(n_feat)
 
-        # Extract features for non-member reference (true label = 0)
-        non_mem_feat  = extractor.extract_single(non_member_sample)
+        # ── Fallback: use score directly when n_target is tiny ─────
+        if n_target <= 5:
+            # Score-based check: after unlearning, score should drop
+            # from ~0.9 (remembered) toward ~0.5 (forgotten)
+            score_passes = mean_target <= 0.60
+            advantage    = abs(mean_target - 0.5)
+            epsilon      = 2 * advantage
 
-        # Get membership scores
-        both_feats   = np.vstack([target_feat, non_mem_feat])
-        scores       = self.shadow_clf.predict_proba(both_feats)[:, 1]
+            return {
+                "n_target":               n_target,
+                "n_non_member":           n_non_mem,
+                "mean_target_membership": mean_target,
+                "auc":                    None,   # not reliable at n=1
+                "advantage":              float(advantage),
+                "epsilon_proxy":          float(epsilon),
+                "passes_threshold":       score_passes,
+                "method":                 "membership_score_fallback",
+                "interpretation": (
+                    f"n_target={n_target} — using membership score "
+                    f"(AUC unreliable at this sample size). "
+                    f"Score={mean_target:.4f}. "
+                    + ("✓ PASSES: score ≤ 0.60 → model no longer "
+                       "strongly recognises this patient."
+                       if score_passes else
+                       f"✗ FAILS: score={mean_target:.4f} > 0.60 → "
+                       f"model still recognises this patient as a member. "
+                       f"Expected: score drops to ~0.50 after successful unlearning.")
+                ),
+            }
 
-        target_score = scores[0]   # membership score for the target
-        non_mem_score = scores[1]  # membership score for non-member
-
-        # AUC with just these 2 samples (simplified — real E4 uses more)
+        # ── Standard AUC-based check for n_target > 5 ─────────────
+        X_all = np.vstack([t_feat, n_feat])
+        y_all = np.array([1]*n_target + [0]*n_non_mem, dtype=int)
+        scores_all = self.shadow_clf.predict_proba(X_all)[:, 1]
         try:
-            auc = roc_auc_score([1, 0], [target_score, non_mem_score])
+            auc = roc_auc_score(y_all, scores_all)
         except Exception:
-            auc = 0.5  # degenerate case
+            auc = 0.5
 
         advantage = abs(auc - 0.5)
-        epsilon   = 2 * advantage  # ε-bridge conjecture
+        epsilon   = 2 * advantage
+        passes    = (0.45 <= auc <= 0.55)
 
         return {
-            "target_membership_score": float(target_score),
-            "non_member_score":        float(non_mem_score),
-            "auc":                     float(auc),
-            "advantage":               float(advantage),
-            "epsilon_proxy":           float(epsilon),
-            "passes_threshold":        auc <= 0.55,
+            "n_target":               n_target,
+            "n_non_member":           n_non_mem,
+            "mean_target_membership": mean_target,
+            "auc":                    float(auc),
+            "advantage":              float(advantage),
+            "epsilon_proxy":          float(epsilon),
+            "passes_threshold":       passes,
+            "method":                 "auc",
             "interpretation": (
-                f"AUC={auc:.4f} → Adv={advantage:.4f} → ε≲{epsilon:.4f}. "
-                + ("✓ PASSES: model appears to have forgotten the patient."
-                   if auc <= 0.55 else
-                   "✗ FAILS: model may still remember the patient.")
+                f"AUC={auc:.4f} (n={n_target}+{n_non_mem}). "
+                + ("✓ PASSES: AUC near random chance."
+                   if passes else
+                   f"✗ FAILS: AUC outside [0.45, 0.55].")
             ),
         }
 
     def compare_before_after(
         self,
-        target_sample:     dict,
-        non_member_sample: dict,
-        member_dataset,
+        target_dataset,
         non_member_dataset,
+        member_dataset,
     ) -> Dict:
-        """
-        Full before/after comparison:
-          1. Train shadow model on pre-unlearning model
-          2. Test target before unlearning (should show membership)
-          3. Test target after unlearning (should show non-membership)
-        """
         print("\n  Training shadow classifier on pre-unlearning model...")
         self.train_shadow_classifier(
-            member_dataset, non_member_dataset,
-            use_model="before",
+            member_dataset, non_member_dataset, use_model="before"
         )
-
-        print("\n  Testing target patient BEFORE unlearning...")
-        before = self.test_target_patient(
-            target_sample, non_member_sample,
-            use_model="before",
+        print("\n  Evaluating target BEFORE unlearning...")
+        before = self.evaluate_on_dataset(
+            target_dataset, non_member_dataset,
+            use_model="before", label="before",
         )
-
-        print("\n  Testing target patient AFTER unlearning...")
-        after = self.test_target_patient(
-            target_sample, non_member_sample,
-            use_model="after",
+        print("\n  Evaluating target AFTER unlearning...")
+        after = self.evaluate_on_dataset(
+            target_dataset, non_member_dataset,
+            use_model="after", label="after",
         )
-
         return {"before": before, "after": after}
