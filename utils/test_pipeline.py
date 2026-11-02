@@ -23,7 +23,7 @@ from transformers import CLIPProcessor, DistilBertTokenizer
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.toy_dataset import generate_toy_dataset
+from data.toy_dataset import ensure_toy_dataset
 from data.patient_dataset import PatientDataset
 from models.multimodal_model import FedMUModel
 
@@ -40,15 +40,8 @@ def main():
     torch.manual_seed(config["project"]["seed"])
 
     # ── Step 1: Generate toy data if not already present ───────────
-    meta_path = Path("data/toy_patients/metadata.json")
-    if not meta_path.exists():
-        print("\n[1/5] Generating toy patient dataset...")
-        generate_toy_dataset(
-            output_dir="data/toy_patients",
-            n_patients=config["data"]["total_patients"],
-        )
-    else:
-        print("\n[1/5] Toy dataset found — skipping generation.")
+    print("\n[1/5] Preparing toy patient dataset...")
+    ensure_toy_dataset("data/toy_patients", config["data"]["total_patients"])
 
     # ── Step 2: Load processors (downloads models on first run) ────
     print("\n[2/5] Loading CLIP processor and DistilBERT tokenizer...")

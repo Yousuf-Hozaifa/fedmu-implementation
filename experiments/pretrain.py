@@ -17,7 +17,7 @@ import torchvision.transforms as T
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.patient_dataset import PatientDataset
-from models.multimodal_model import MultimodalModel
+from models.multimodal_model import FedMUModel
 from models.lora_model import FedMULoRAModel
 from federated.nodes.data_splitter import (
     split_patients_for_federated,
@@ -80,14 +80,11 @@ def main():
             json.dump(patients, f)
     else:
         print("[pretrain] WARNING: Real dataset not found, falling back to toy data")
-        from data.toy_dataset import generate_toy_dataset
+        from data.toy_dataset import ensure_toy_dataset
         n = config['data'].get('total_patients', 50)
         
-        if not Path(meta_file).exists():
-            print("\n[1/6] Generating toy patient dataset...")
-            generate_toy_dataset(data_root, n)
-        else:
-            print("\n[1/6] Toy dataset found.")
+        print("\n[1/6] Preparing toy patient dataset...")
+        ensure_toy_dataset(data_root, n)
 
     # ── Split data across nodes ────────────────────────────────────
     print("\n[2/6] Splitting patients across federated nodes...")
@@ -131,8 +128,9 @@ def main():
     # ── Build global model ─────────────────────────────────────────
     print("\n[4/6] Building global model with LoRA adapters...")
     
-    # -> CRITICAL FIX: Swap old FedMUModel for the new MultimodalModel
-    base = MultimodalModel(config=config)
+    # FedMULoRAModel requires FedMUModel's interface (projection.layer1/layer2,
+    # pixel_values kwarg, dict output). MultimodalModel does not provide it.
+    base = FedMUModel(freeze_encoders=False)
     
     global_model = FedMULoRAModel(
         base_model=base,

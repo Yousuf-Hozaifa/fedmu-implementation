@@ -22,7 +22,7 @@ import torchvision.transforms as T
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from data.toy_dataset import generate_toy_dataset
+from data.toy_dataset import ensure_toy_dataset
 from data.patient_dataset import PatientDataset
 from models.multimodal_model import FedMUModel
 from models.lora_model import FedMULoRAModel
@@ -39,10 +39,7 @@ def main():
     torch.manual_seed(config["project"]["seed"])
 
     # ── Load data ──────────────────────────────────────────────────
-    from pathlib import Path as P
-    if not P("data/toy_patients/metadata.json").exists():
-        generate_toy_dataset("data/toy_patients",
-                              config["data"]["total_patients"])
+    ensure_toy_dataset("data/toy_patients", config["data"]["total_patients"])
 
     clip_proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")

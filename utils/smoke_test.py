@@ -35,9 +35,6 @@ checks = [
     ("PEFT",
      lambda: __import__('peft').__version__),
 
-    ("Flower (flwr)",
-     lambda: __import__('flwr').__version__),
-
     ("scikit-learn",
      lambda: __import__('sklearn').__version__),
 

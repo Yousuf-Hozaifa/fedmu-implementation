@@ -49,6 +49,10 @@ def split_patients_for_federated(
     with open(metadata_file) as f:
         metadata = json.load(f)
 
+    # pretrain.py writes a list of patient dicts for the IU dataset
+    if isinstance(metadata, list):
+        metadata = {p["patient_id"]: p for p in metadata}
+
     all_pids = list(metadata.keys())
     rng.shuffle(all_pids)
 

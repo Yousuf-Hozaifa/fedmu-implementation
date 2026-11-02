@@ -1,0 +1,3 @@
+# Only for the full LLaVA-1.5-7B mode (4-bit, needs a >=24 GB GPU)
+-r requirements.txt
+bitsandbytes

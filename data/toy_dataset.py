@@ -192,3 +192,23 @@ if __name__ == "__main__":
         if k != "labels":
             print(f"  {k}: {v}")
     print(f"  labels (first 5): {sample['labels'][:5]}")
+
+
+def ensure_toy_dataset(output_dir: str = "data/toy_patients",
+                       n_patients: int = 50, seed: int = 42) -> None:
+    """Generate the toy dataset unless metadata AND all images already exist.
+
+    metadata.json is committed to git but images/*.png are git-ignored, so
+    checking only for metadata.json made fresh clones crash on missing images.
+    """
+    import json
+    out = Path(output_dir)
+    meta = out / "metadata.json"
+    if meta.exists():
+        with open(meta, encoding="utf-8") as f:
+            records = json.load(f)
+        if all((out / r["image_path"]).exists() for r in records.values()):
+            print("Toy dataset found - skipping generation.")
+            return
+        print("Toy metadata found but images are missing - regenerating.")
+    generate_toy_dataset(output_dir, n_patients, seed)
